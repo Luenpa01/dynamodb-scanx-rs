@@ -22,8 +22,9 @@ pub struct Args {
     #[arg(long, default_value_t = 32, help_heading = "DynamoDB Options")]
     pub total_segments: i32,
 
-    #[arg(long, help_heading = "AWS Credentials")]
-    pub region: Option<String>,
+    /// AWS Region. Defaults to us-east-1 (N. Virginia).
+    #[arg(long, default_value = "us-east-1", help_heading = "AWS Credentials")]
+    pub region: String,
 
     #[arg(long, help_heading = "AWS Credentials")]
     pub role_arn: Option<String>,
@@ -48,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize the STS Client
     let client = build_ddb_client(
         args.role_arn,
-        args.region,
+        Some(args.region),
         &args.role_session_name,
         args.external_id,
         None,
