@@ -12,7 +12,7 @@ pub struct ScanOutput {
 
 pub struct ParallelScanPaginator {
     client: Client,
-    workers: usize,
+    //workers: usize,
     max_retries: u32,
     semaphore: Arc<Semaphore>,
 }
@@ -22,7 +22,7 @@ impl ParallelScanPaginator {
         let actual_workers = workers.unwrap_or(256);
         Self {
             client,
-            workers: actual_workers,
+            //workers: actual_workers,
             max_retries,
             // Initializes the semaphore to limit concurrent connections to AWS
             semaphore: Arc::new(Semaphore::new(actual_workers)),
