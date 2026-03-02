@@ -44,7 +44,6 @@ pub struct Args {
     #[arg(short, long, help_heading = "Output")]
     pub output: Option<String>,
 
-    // --- FILTER PARAMETERS ---
     #[arg(short = 'f', long = "filter-field", help_heading = "Filters")]
     pub filter_fields: Vec<String>,
 
@@ -75,14 +74,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    // ==========================================
-    // DYNAMIC FILTER LOGIC & AUTO PROBE
-    // ==========================================
     let mut filter_expr = None;
     let mut eav = None;
     let mut ean = None;
 
-    // Checks if the user provided any filters
     if !args.filter_fields.is_empty() {
         if args.filter_fields.len() != args.filter_values.len() {
             eprintln!("❌ Error: The number of fields (-f) must match the number of values (-v).");
@@ -93,11 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut values_map = HashMap::new();
         let mut names_map = HashMap::new();
 
-        // Iterates through the provided fields and values
         for (i, (field, val)) in args.filter_fields.iter().zip(args.filter_values.iter()).enumerate() {
             pb.set_message(format!("🔍 Probing type for '{}'...", field));
             
-            // Samples 20 records to infer the data type
             let probe_res = probe_attribute_type(
                 &client,
                 &args.table_name,
@@ -107,15 +100,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 false,
             ).await?;
 
-            // Defaults to String ("S") if the probe fails to find a sample
             let ddb_type = probe_res.ddb_type.unwrap_or_else(|| "S".to_string());
             pb.suspend(|| {
                 println!("💡 Inferred type for '{}': {} (based on {} samples)", field, ddb_type, probe_res.samples_seen);
             });
 
-            // Converts the raw terminal string into a strongly-typed DynamoDB AttributeValue
             let attr_val = build_attribute_value(&ddb_type, val)?;
-
             let name_key = format!("#f{}", i);
             let val_key = format!(":v{}", i);
 
@@ -132,14 +122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("⚙️  Filter Expression generated: {}", filter_expr.as_ref().unwrap());
         });
     }
-    // ==========================================
-    // END OF FILTER LOGIC
-    // ==========================================
 
     pb.set_message("Scanning DynamoDB...");
     let paginator = ParallelScanPaginator::new(client, args.workers, args.retries_max_attempts);
     
-    // Injects the resolved filters into the paginator engine
     let mut rx = paginator.paginate(
         args.table_name.clone(), 
         args.total_segments,
@@ -148,18 +134,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ean
     ).await;
 
-    let is_file_output = args.output.is_some();
-    let mut writer: Box<dyn Write> = match &args.output {
-        Some(path) => {
-            let file = File::create(path)?;
-            Box::new(BufWriter::with_capacity(8 * 1024 * 1024, file))
+    // ==========================================
+    // OUTPUT ROUTING LOGIC (JSONL vs CSV)
+    // ==========================================
+    let is_csv = args.output.as_ref().map(|p| p.ends_with(".csv")).unwrap_or(false);
+    
+    // Initializes the CSV writer if the extension is .csv
+    let mut csv_writer = if is_csv {
+        Some(csv::Writer::from_path(args.output.as_ref().unwrap())?)
+    } else {
+        None
+    };
+    
+    // Initializes the JSONL / Stdout writer otherwise
+    let mut json_writer: Option<Box<dyn Write>> = if !is_csv {
+        match &args.output {
+            Some(path) => {
+                let file = File::create(path)?;
+                Some(Box::new(BufWriter::with_capacity(8 * 1024 * 1024, file)))
+            }
+            None => Some(Box::new(io::stdout())),
         }
-        None => Box::new(io::stdout()),
+    } else {
+        None
     };
 
     let mut total_items = 0;
+    let mut csv_headers: Option<Vec<String>> = None;
 
-    // Consumes the stream and writes data
     while let Some(result) = rx.recv().await {
         match result {
             Ok(output) => {
@@ -169,14 +171,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         pb.set_position(total_items);
 
                         let json_val = parse_item(&item);
-                        let output_line = json_val.to_string();
                         
-                        if is_file_output {
-                            writeln!(writer, "{}", output_line)?;
+                        if is_csv {
+                            // Extracts CSV headers from the very first item dynamically
+                            if csv_headers.is_none() {
+                                if let Value::Object(map) = &json_val {
+                                    let mut headers: Vec<String> = map.keys().cloned().collect();
+                                    headers.sort(); // Sorts alphabetically for consistent column ordering
+                                    csv_writer.as_mut().unwrap().write_record(&headers)?;
+                                    csv_headers = Some(headers);
+                                }
+                            }
+                            
+                            // Flattens the JSON and writes the CSV row
+                            if let Some(headers) = &csv_headers {
+                                if let Value::Object(map) = &json_val {
+                                    let mut record = Vec::new();
+                                    for h in headers {
+                                        let val_str = match map.get(h) {
+                                            Some(Value::String(s)) => s.clone(),
+                                            Some(Value::Null) => "".to_string(),
+                                            Some(other) => other.to_string(), // Safely stringifies nested objects/arrays
+                                            None => "".to_string(),
+                                        };
+                                        record.push(val_str);
+                                    }
+                                    csv_writer.as_mut().unwrap().write_record(&record)?;
+                                }
+                            }
                         } else {
-                            pb.suspend(|| {
-                                writeln!(writer, "{}", output_line).unwrap();
-                            });
+                            // Standard JSONL fast path
+                            let output_line = json_val.to_string();
+                            if args.output.is_some() {
+                                writeln!(json_writer.as_mut().unwrap(), "{}", output_line)?;
+                            } else {
+                                pb.suspend(|| {
+                                    writeln!(json_writer.as_mut().unwrap(), "{}", output_line).unwrap();
+                                });
+                            }
                         }
                     }
                 }
@@ -189,7 +221,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    writer.flush()?;
+    // Ensures all buffers are flushed safely to disk
+    if let Some(mut w) = csv_writer {
+        w.flush()?;
+    }
+    if let Some(mut w) = json_writer {
+        w.flush()?;
+    }
+
     pb.finish_with_message(format!("✅ Scan complete! {} items exported.", total_items));
     Ok(())
 }
