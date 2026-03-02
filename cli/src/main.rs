@@ -2,9 +2,9 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
 
-// Imports your custom core library
 use dynamodb_scanx_core::paginator::ParallelScanPaginator;
 use dynamodb_scanx_core::sts::build_ddb_client;
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -40,6 +40,10 @@ pub struct Args {
 
     #[arg(long, default_value_t = 10, help_heading = "Performance")]
     pub retries_max_attempts: u32,
+
+    /// Output file path (.csv -> CSV; .jsonl -> JSONL). If omitted, writes to stdout.
+    #[arg(short, long, help_heading = "Output")]
+    pub output: Option<String>,
 }
 
 #[tokio::main]
@@ -69,11 +73,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paginator = ParallelScanPaginator::new(client, args.workers, args.retries_max_attempts);
     let mut rx = paginator.paginate(args.table_name.clone(), args.total_segments).await;
 
-    let mut total_items = 0;
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
+    // 4. Setup the Output Writer (Dynamic Dispatch)
+    let is_file_output = args.output.is_some();
+    let mut writer: Box<dyn Write> = match &args.output {
+        Some(path) => {
+            let file = File::create(path)?;
+            Box::new(BufWriter::with_capacity(8 * 1024 * 1024, file))
+        }
+        None => Box::new(io::stdout()),
+    };
 
-    // 4. Consume the MPSC Channel and stream to JSONL
+    let mut total_items = 0;
+
+    // 5. Consume the MPSC Channel and stream to JSONL
     while let Some(result) = rx.recv().await {
         match result {
             Ok(output) => {
@@ -82,26 +94,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         total_items += 1;
                         pb.set_position(total_items);
 
-                        // Converts DynamoDB AttributeValues to standard JSON
                         let json_val = parse_item(&item);
+                        let output_line = json_val.to_string();
                         
-                        // Writes to standard output instantly (streaming)
-                        // We use pb.suspend to avoid corrupting the progress bar in the terminal
-                        pb.suspend(|| {
-                            writeln!(handle, "{}", json_val.to_string()).unwrap();
-                        });
+                        // Writes to file directly, or suspends the progress bar if writing to terminal
+                        if is_file_output {
+                            writeln!(writer, "{}", output_line)?;
+                        } else {
+                            pb.suspend(|| {
+                                writeln!(writer, "{}", output_line).unwrap();
+                            });
+                        }
                     }
                 }
             }
             Err(e) => {
                 pb.suspend(|| {
-                    eprintln!("Error during scan: {}", e);
+                    eprintln!("Error during scan: {:?}", e);
                 });
             }
         }
     }
 
-    pb.finish_with_message("✅ Scan complete!");
+    // Flushes any remaining data in the buffer to the disk
+    writer.flush()?;
+
+    pb.finish_with_message(format!("✅ Scan complete! {} items exported.", total_items));
     Ok(())
 }
 
@@ -126,8 +144,8 @@ fn parse_attr(attr: &AttributeValue) -> Value {
         AttributeValue::Bool(b) => Value::Bool(*b),
         AttributeValue::M(m) => parse_item(m),
         AttributeValue::L(l) => Value::Array(l.iter().map(parse_attr).collect()),
-        AttributeValue::Ss(ss) => Value::Array(ss.iter().map(|s| Value::String(s.clone())).collect()),
-        AttributeValue::Ns(ns) => Value::Array(ns.iter().map(|n| {
+        AttributeValue::Ss(ss) => Value::Array(ss.iter().map(|s: &String| Value::String(s.clone())).collect()),
+        AttributeValue::Ns(ns) => Value::Array(ns.iter().map(|n: &String| {
             if let Ok(i) = n.parse::<i64>() { json!(i) }
             else if let Ok(f) = n.parse::<f64>() { json!(f) }
             else { Value::String(n.clone()) }
