@@ -1,112 +1,123 @@
-use aws_sdk_dynamodb::operation::scan::ScanOutput;
-use aws_sdk_dynamodb::types::AttributeValue; // Imports the DynamoDB AttributeValue type
+use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::Client;
-use std::collections::HashMap; // Imports the HashMap for the key structure
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
-use tokio::time::sleep;
 
-/// Manages parallel scanning operations for a DynamoDB table.
-/// Utilizes asynchronous tasks and an MPSC channel to stream results safely.
+#[derive(Debug)]
+pub struct ScanOutput {
+    pub items: Option<Vec<HashMap<String, AttributeValue>>>,
+}
+
 pub struct ParallelScanPaginator {
     client: Client,
     workers: usize,
     max_retries: u32,
+    semaphore: Arc<Semaphore>,
 }
 
 impl ParallelScanPaginator {
-    /// Initializes a new instance of the paginator.
-    /// Defaults to 256 workers if not explicitly provided.
     pub fn new(client: Client, workers: Option<usize>, max_retries: u32) -> Self {
+        let actual_workers = workers.unwrap_or(256);
         Self {
             client,
-            workers: workers.unwrap_or(256),
+            workers: actual_workers,
             max_retries,
+            // Initializes the semaphore to limit concurrent connections to AWS
+            semaphore: Arc::new(Semaphore::new(actual_workers)),
         }
     }
 
-    /// Starts the parallel scan and returns a receiver channel to stream pages.
-    /// Limits concurrent requests using a semaphore based on the worker count.
     pub async fn paginate(
         &self,
         table_name: String,
         total_segments: i32,
+        filter_expression: Option<String>,
+        expression_attribute_values: Option<HashMap<String, AttributeValue>>,
+        expression_attribute_names: Option<HashMap<String, String>>,
     ) -> mpsc::Receiver<Result<ScanOutput, String>> {
-        // Calculates the actual number of workers to prevent over-allocation
-        let actual_workers = self.workers.min(total_segments.max(1) as usize);
-        
-        // Creates a channel to stream the pages back to the caller
-        let (tx, rx) = mpsc::channel(actual_workers * 2);
-        
-        // Semaphore controls the maximum number of concurrent active tasks
-        let semaphore = Arc::new(Semaphore::new(actual_workers));
-        let client = self.client.clone(); 
+        let (tx, rx) = mpsc::channel(100);
 
         for segment in 0..total_segments {
-            let tx_clone = tx.clone();
-            let client_clone = client.clone();
-            let sem_clone = semaphore.clone();
-            let table_clone = table_name.clone();
-            let retries = self.max_retries;
+            let tx = tx.clone();
+            let client = self.client.clone();
+            let table_name = table_name.clone();
+            let permit = self.semaphore.clone().acquire_owned().await.unwrap();
+            let max_retries = self.max_retries;
+            
+            // Clones the AWS filter logic for each async worker
+            let fe = filter_expression.clone();
+            let eav = expression_attribute_values.clone();
+            let ean = expression_attribute_names.clone();
 
-            // Spawns an asynchronous, non-blocking task for each segment
             tokio::spawn(async move {
-                // Waits for an available permit before sending the network request
-                let _permit = match sem_clone.acquire().await {
-                    Ok(p) => p,
-                    Err(_) => return, // Stops execution if the semaphore is closed
-                };
-                
-                let mut current_retries = 0;
-                
-                // Explicitly defines the type for the exclusive start key
+                let _permit = permit;
+                // Explicit type annotation required by Rust compiler for AWS SDK v1+
                 let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
 
                 loop {
-                    let mut request = client_clone
-                        .scan()
-                        .table_name(&table_clone)
-                        .segment(segment)
-                        .total_segments(total_segments);
+                    let mut retries = 0;
+                    let mut backoff = Duration::from_millis(50);
 
-                    if let Some(key) = &exclusive_start_key {
-                        request = request.set_exclusive_start_key(Some(key.clone()));
-                    }
+                    loop {
+                        let mut request = client
+                            .scan()
+                            .table_name(&table_name)
+                            .segment(segment)
+                            .total_segments(total_segments);
 
-                    match request.send().await {
-                        Ok(output) => {
-                            current_retries = 0;
-                            exclusive_start_key = output.last_evaluated_key.clone();
-                            let has_more = exclusive_start_key.is_some();
-                            
-                            // Sends the retrieved page through the channel
-                            if tx_clone.send(Ok(output)).await.is_err() {
-                                break; // Breaks the loop if the receiver is dropped
-                            }
-
-                            if !has_more {
-                                break; // Completes the segment processing
+                        if let Some(key) = &exclusive_start_key {
+                            for (k, v) in key {
+                                request = request.exclusive_start_key(k, v.clone());
                             }
                         }
-                        Err(e) => {
-                            current_retries += 1;
-                            if current_retries > retries {
-                                let err_msg = format!("Segment {} failed after {} retries: {}", segment, retries, e);
-                                let _ = tx_clone.send(Err(err_msg)).await;
+
+                        // INJECTS DYNAMODB FILTERS HERE
+                        if let Some(ref expr) = fe {
+                            request = request.filter_expression(expr);
+                        }
+                        if let Some(ref values) = eav {
+                            for (k, v) in values {
+                                request = request.expression_attribute_values(k, v.clone());
+                            }
+                        }
+                        if let Some(ref names) = ean {
+                            for (k, v) in names {
+                                request = request.expression_attribute_names(k, v);
+                            }
+                        }
+
+                        match request.send().await {
+                            Ok(output) => {
+                                exclusive_start_key = output.last_evaluated_key;
+                                
+                                let scan_output = ScanOutput { items: output.items };
+
+                                if tx.send(Ok(scan_output)).await.is_err() {
+                                    return;
+                                }
                                 break;
                             }
-                            
-                            // Implements a simple exponential backoff strategy
-                            let backoff = 2u64.pow(current_retries) * 100;
-                            sleep(Duration::from_millis(backoff)).await;
+                            Err(e) => {
+                                if retries >= max_retries {
+                                    let err_msg = format!("Segment {} failed after {} retries: {:?}", segment, retries, e);
+                                    let _ = tx.send(Err(err_msg)).await;
+                                    return;
+                                }
+                                retries += 1;
+                                tokio::time::sleep(backoff).await;
+                                backoff *= 2;
+                            }
                         }
+                    }
+
+                    if exclusive_start_key.is_none() {
+                        break;
                     }
                 }
             });
         }
-
-        // Returns the receiver so the caller can iterate asynchronously
         rx
     }
 }

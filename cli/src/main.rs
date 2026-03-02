@@ -7,6 +7,7 @@ use std::io::{self, BufWriter, Write};
 
 use dynamodb_scanx_core::paginator::ParallelScanPaginator;
 use dynamodb_scanx_core::sts::build_ddb_client;
+use dynamodb_scanx_core::auto_type_probe::{probe_attribute_type, build_attribute_value};
 use aws_sdk_dynamodb::types::AttributeValue;
 
 /// Blazing fast, concurrent DynamoDB parallel scanner & SRE toolkit.
@@ -22,7 +23,6 @@ pub struct Args {
     #[arg(long, default_value_t = 32, help_heading = "DynamoDB Options")]
     pub total_segments: i32,
 
-    /// AWS Region. Defaults to us-east-1 (N. Virginia).
     #[arg(long, default_value = "us-east-1", help_heading = "AWS Credentials")]
     pub region: String,
 
@@ -41,16 +41,24 @@ pub struct Args {
     #[arg(long, default_value_t = 10, help_heading = "Performance")]
     pub retries_max_attempts: u32,
 
-    /// Output file path (.csv -> CSV; .jsonl -> JSONL). If omitted, writes to stdout.
     #[arg(short, long, help_heading = "Output")]
     pub output: Option<String>,
+
+    // --- FILTER PARAMETERS ---
+    #[arg(short = 'f', long = "filter-field", help_heading = "Filters")]
+    pub filter_fields: Vec<String>,
+
+    #[arg(short = 'v', long = "filter-value", help_heading = "Filters")]
+    pub filter_values: Vec<String>,
+
+    #[arg(long, default_value = "AND", help_heading = "Filters")]
+    pub filter_logic: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // 1. Initialize the STS Client
     let client = build_ddb_client(
         args.role_arn,
         Some(args.region),
@@ -59,21 +67,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None,
     ).await?;
 
-    // 2. Setup the Progress Bar
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.green} [{elapsed_precise}] {msg} {pos} items scanned")?
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
     );
-    pb.set_message("Scanning DynamoDB...");
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
-    // 3. Launch the Asynchronous Paginator
-    let paginator = ParallelScanPaginator::new(client, args.workers, args.retries_max_attempts);
-    let mut rx = paginator.paginate(args.table_name.clone(), args.total_segments).await;
+    // ==========================================
+    // DYNAMIC FILTER LOGIC & AUTO PROBE
+    // ==========================================
+    let mut filter_expr = None;
+    let mut eav = None;
+    let mut ean = None;
 
-    // 4. Setup the Output Writer (Dynamic Dispatch)
+    // Checks if the user provided any filters
+    if !args.filter_fields.is_empty() {
+        if args.filter_fields.len() != args.filter_values.len() {
+            eprintln!("❌ Error: The number of fields (-f) must match the number of values (-v).");
+            std::process::exit(1);
+        }
+
+        let mut fe_parts = Vec::new();
+        let mut values_map = HashMap::new();
+        let mut names_map = HashMap::new();
+
+        // Iterates through the provided fields and values
+        for (i, (field, val)) in args.filter_fields.iter().zip(args.filter_values.iter()).enumerate() {
+            pb.set_message(format!("🔍 Probing type for '{}'...", field));
+            
+            // Samples 20 records to infer the data type
+            let probe_res = probe_attribute_type(
+                &client,
+                &args.table_name,
+                field,
+                None,
+                20, 
+                false,
+            ).await?;
+
+            // Defaults to String ("S") if the probe fails to find a sample
+            let ddb_type = probe_res.ddb_type.unwrap_or_else(|| "S".to_string());
+            pb.suspend(|| {
+                println!("💡 Inferred type for '{}': {} (based on {} samples)", field, ddb_type, probe_res.samples_seen);
+            });
+
+            // Converts the raw terminal string into a strongly-typed DynamoDB AttributeValue
+            let attr_val = build_attribute_value(&ddb_type, val)?;
+
+            let name_key = format!("#f{}", i);
+            let val_key = format!(":v{}", i);
+
+            fe_parts.push(format!("{} = {}", name_key, val_key));
+            names_map.insert(name_key, field.clone());
+            values_map.insert(val_key, attr_val);
+        }
+
+        filter_expr = Some(fe_parts.join(&format!(" {} ", args.filter_logic)));
+        eav = Some(values_map);
+        ean = Some(names_map);
+        
+        pb.suspend(|| {
+            println!("⚙️  Filter Expression generated: {}", filter_expr.as_ref().unwrap());
+        });
+    }
+    // ==========================================
+    // END OF FILTER LOGIC
+    // ==========================================
+
+    pb.set_message("Scanning DynamoDB...");
+    let paginator = ParallelScanPaginator::new(client, args.workers, args.retries_max_attempts);
+    
+    // Injects the resolved filters into the paginator engine
+    let mut rx = paginator.paginate(
+        args.table_name.clone(), 
+        args.total_segments,
+        filter_expr,
+        eav,
+        ean
+    ).await;
+
     let is_file_output = args.output.is_some();
     let mut writer: Box<dyn Write> = match &args.output {
         Some(path) => {
@@ -85,7 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut total_items = 0;
 
-    // 5. Consume the MPSC Channel and stream to JSONL
+    // Consumes the stream and writes data
     while let Some(result) = rx.recv().await {
         match result {
             Ok(output) => {
@@ -97,7 +171,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let json_val = parse_item(&item);
                         let output_line = json_val.to_string();
                         
-                        // Writes to file directly, or suspends the progress bar if writing to terminal
                         if is_file_output {
                             writeln!(writer, "{}", output_line)?;
                         } else {
@@ -116,14 +189,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Flushes any remaining data in the buffer to the disk
     writer.flush()?;
-
     pb.finish_with_message(format!("✅ Scan complete! {} items exported.", total_items));
     Ok(())
 }
 
-/// Converts a DynamoDB item (HashMap of AttributeValues) into a serde_json::Value.
 fn parse_item(item: &HashMap<String, AttributeValue>) -> Value {
     let mut map = serde_json::Map::new();
     for (k, v) in item {
@@ -132,7 +202,6 @@ fn parse_item(item: &HashMap<String, AttributeValue>) -> Value {
     Value::Object(map)
 }
 
-/// Recursively parses DynamoDB AttributeValues into standard JSON primitives.
 fn parse_attr(attr: &AttributeValue) -> Value {
     match attr {
         AttributeValue::S(s) => Value::String(s.clone()),
@@ -151,6 +220,6 @@ fn parse_attr(attr: &AttributeValue) -> Value {
             else { Value::String(n.clone()) }
         }).collect()),
         AttributeValue::Null(_) => Value::Null,
-        _ => Value::Null, // Safely ignores binary types for standard JSON output
+        _ => Value::Null,
     }
 }
