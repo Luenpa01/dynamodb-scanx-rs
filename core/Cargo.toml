@@ -1,0 +1,15 @@
+[package]
+name = "dynamodb-scanx-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Tu Nombre <tu@email.com>"]
+description = "Core engine for DynamoDB parallel scanning and STS AssumeRole."
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+
+# AWS SDKs (El reemplazo de boto3)
+aws-config = "1.1"
+aws-sdk-sts = "1.1"
+aws-sdk-dynamodb = "1.1"
+aws-credential-types = "1.1"
