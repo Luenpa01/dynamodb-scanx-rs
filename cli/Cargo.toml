@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Luis Enrique Parada <pradapop78@gmail.com>"]
 description = "CLI tool for blazing fast DynamoDB parallel scanning"
+repository = "https://github.com/Luenpa01/dynamodb-scanx-rs"
 
 [dependencies]
-dynamodb-scanx-core = { path = "../core" }
+dynamodb-scanx-core ="0.1.0"
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4.4", features = ["derive"] }
 indicatif = "0.17"
