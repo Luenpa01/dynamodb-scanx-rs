@@ -5,6 +5,7 @@ edition = "2024"
 authors = ["Luis Enrique Parada <pradapop78@gmail.com>"]
 description = "CLI tool for blazing fast DynamoDB parallel scanning"
 repository = "https://github.com/Luenpa01/dynamodb-scanx-rs"
+license = MIT
 
 [dependencies]
 dynamodb-scanx-core ="0.1.0"
