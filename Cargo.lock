@@ -686,7 +686,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "clap",
  "csv",
- "dynamodb-scanx-core",
+ "dynamodb-scanx-core 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "indicatif",
  "serde_json",
  "tokio",
@@ -701,6 +701,19 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 [[package]]
 name = "dynamodb-scanx-core"
 version = "0.1.0"
+dependencies = [
+ "aws-config",
+ "aws-credential-types",
+ "aws-sdk-dynamodb",
+ "aws-sdk-sts",
+ "tokio",
+]
+
+[[package]]
+name = "dynamodb-scanx-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f73a266d6567d01d4bfbdeb656d5a4f253bf0c2c0da5ad7d9c08a080bb701a4"
 dependencies = [
  "aws-config",
  "aws-credential-types",
